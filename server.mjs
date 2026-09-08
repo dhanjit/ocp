@@ -1625,6 +1625,27 @@ function spawnClaudeProcess(model, messages, conversationId, keyName, releaseSlo
   const spawnOpts = { env, stdio: ["pipe", "pipe", "pipe"] };
   if (decision.isolated && decision.token) {
     env.HOME = decision.home;
+    // HOME alone is not home isolation on win32. Node's os.homedir() — and therefore claude's
+    // `~/.claude` resolution — reads USERPROFILE on Windows and ignores HOME entirely, so a
+    // HOME-only override left every spawn loading the operator's REAL ~/.claude: user skills,
+    // plugins, hooks and MCP tool definitions, on every request. Measured on a Windows host,
+    // 3 runs each, prompt tokens = cache_read + cache_creation: HOME only ~105,000 tokens and a
+    // 30.7s median wall time; with USERPROFILE set too, a constant 43,095 tokens and 6.3s. The
+    // 43,095 is identical across runs, which is what an actually-isolated home looks like.
+    //
+    // Set unconditionally rather than behind a platform check: this branch's whole contract is
+    // "claude runs under a home we control", and POSIX hosts do not read USERPROFILE, so the
+    // assignment is inert there. A platform branch would just be a second thing to keep true.
+    //
+    // Safe for auth because the env token below is authoritative for `-p` — verified by
+    // execution, not argument: with USERPROFILE isolated and the token injected, 3/3 spawns
+    // returned is_error:false. (Without the token, the same env yields "Not logged in", which is
+    // the proof the isolation actually bites.)
+    //
+    // NOT fixed here: lib/tui/session.mjs has the same HOME-only shape (buildTuiCmd's `env`
+    // prefix, and the tmux server env in bootTuiPane). That path needs tmux, so it cannot run on
+    // the platform this defect affects; fixing it would be an untested change to a working path.
+    env.USERPROFILE = decision.home;
     env.CLAUDE_CODE_OAUTH_TOKEN = decision.token; // env token is authoritative for -p
     env.CLAUDE_CODE_DISABLE_CLAUDE_MDS = "1";
     env.CLAUDE_CODE_DISABLE_AUTO_MEMORY = "1";
