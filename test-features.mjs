@@ -5072,6 +5072,61 @@ ltTest("integration: the non-multi path still passes --allowedTools and never --
   } finally { _ltRmRetry(dir); }
 });
 
+// -- CLAUDE_TOOLS="" must actually empty the tool schema (reported downstream) ------------------
+//
+// Reported as CLAUDE_ALLOWED_TOOLS="" being ignored: true, and not the whole bug. `||` does read an
+// explicit empty string as unset, but fixing ONLY that would leave the instance no safer and make
+// the reporting worse -- with ALLOWED_TOOLS === [] the `length > 0` arm stops pushing a flag at
+// all, so the child spawns under the CLI's OWN default set while /health reports an empty list.
+// The reported acceptance check ("/health reports an empty tool list") would have gone green on a
+// child that still had Bash.
+//
+// The cause underneath is that --allowedTools cannot take a tool away. Per `claude --help`,
+// --allowedTools is a "list of tool names to allow" -- a pre-approval list, so it can only widen;
+// --tools is "the list of available tools from the built-in set", and the empty string there
+// disables all of them. That is the only removal knob, and it is exactly what the multi-tenant
+// branch above already relies on.
+//
+// So this pins the FLAG, not the variable: it reads the argv a real child was really spawned with.
+// A source grep would pass on code that computes the right flag and then never pushes it.
+ltTest('integration: CLAUDE_TOOLS="" spawns `--tools ""`, so a single-user instance has NO tools', async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  const argvFile = join(dir, "argv-tools-empty.txt");
+  try {
+    const { child, buf, port } = await ltBootFresh(
+      { CLAUDE_AUTH_MODE: "none", CLAUDE_TOOLS: "", CLAUDE_BIN: fake, ARGV_CAPTURE: argvFile }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `server never listened - ${ltDiag(buf)}`);
+      const r = await ltPostStatus(port, { model: "sonnet", messages: [{ role: "user", content: "hi" }] });
+      assert.equal(r.status, 200, `expected the spawn to succeed - ${r.status} ${r.text.slice(0, 200)}`);
+
+      const argv = ltArgvCalls(argvFile);
+      assert.ok(argv.length > 0, `no argv captured: the fake never ran - ${ltDiag(buf)}`);
+      const spIdx = argv.indexOf("--system-prompt-file");
+      assert.ok(spIdx > -1, `argv has no --system-prompt-file: ${JSON.stringify(argv.slice(0, 8))}`);
+      assert.ok(argv.length > spIdx + 2, `argv ends at the system prompt, so no tool flag was pushed: ${JSON.stringify(argv)}`);
+
+      // ONE assertion over the whole tail, same reasoning as the multi test above: --allowedTools
+      // must be ABSENT, not merely accompanied. Pushing both would leave every tool available
+      // while the deny looked deliberate.
+      const tail = argv.slice(spIdx + 2);
+      assert.deepEqual(tail, ["--tools", ""],
+        `CLAUDE_TOOLS="" did not empty the built-in schema: ${JSON.stringify(tail)}`);
+
+      // The operator-facing half, killed by a DIFFERENT mutation than the deepEqual above (one in
+      // buildCliArgs, one in the banner), so neither claim hides the other.
+      const banner = buf.out.split("\n").find(l => l.startsWith("Tools: "));
+      assert.ok(banner, `no "Tools:" banner line at all - ${ltDiag(buf)}`);
+      assert.equal(banner, 'Tools: none (CLAUDE_TOOLS="" empties the built-in schema)',
+        `the boot banner still advertises a tool set: ${banner}`);
+    } finally {
+      child.kill("SIGKILL");
+      await ltDrain(() => buf.closed, "tools-empty", 5000);
+    }
+  } finally { _ltRmRetry(dir); }
+});
+
 // ── #370: the TUI LAN gate's call site (server.mjs:829) ────────────────────────────────────────
 // The #339 shape, one gate over: isLoopbackBind has 8 unit blocks and is correct; what nothing
 // asserted is that :829 still CONSULTS it. The question is not "is the predicate tested" but "does

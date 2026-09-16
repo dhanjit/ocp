@@ -15,6 +15,9 @@
  *   CLAUDE_BIN                   — path to claude binary (default: auto-detect)
  *   CLAUDE_TIMEOUT               — per-request timeout in ms (default: 600000)
  *   CLAUDE_ALLOWED_TOOLS         — comma-separated tools to allow (default: expanded set)
+ *   CLAUDE_TOOLS                 — comma-separated tools to make AVAILABLE; "" disables all of
+ *                                  them. Unlike CLAUDE_ALLOWED_TOOLS, which is a pre-approval
+ *                                  list and can only widen, this is the flag that can remove one
  *   CLAUDE_SKIP_PERMISSIONS      — "true" to bypass all permission checks (default: false)
  *   CLAUDE_SYSTEM_PROMPT         — system prompt appended to all requests
  *   CLAUDE_MCP_CONFIG            — path to MCP server config JSON file
@@ -367,6 +370,17 @@ const SKIP_PERMISSIONS = process.env.CLAUDE_SKIP_PERMISSIONS === "true";
 const ALLOWED_TOOLS = (process.env.CLAUDE_ALLOWED_TOOLS ||
   "Bash,Read,Write,Edit,Glob,Grep,WebSearch,WebFetch,Agent"
 ).split(",").map(s => s.trim()).filter(Boolean);
+// Presence, not truthiness. `??` so an explicitly empty CLAUDE_TOOLS is distinguishable from an
+// unset one, which `||` cannot do -- and that distinction is the whole point of the variable,
+// because the empty string is the CLI's documented way to disable every built-in tool.
+//
+// This is deliberately NOT a fix to CLAUDE_ALLOWED_TOOLS above, which is what was tried first
+// (reported downstream). --allowedTools is a PRE-APPROVAL list per `claude --help` and cannot take a
+// tool away, so an empty one disables nothing. Teaching that variable to honour "" would only have
+// stopped the flag being pushed at all, leaving the child on the CLI's own defaults -- every tool
+// -- while /health reported an empty list, which is a worse failure than the one it replaced.
+// Availability is --tools; permission is --allowedTools. They are different axes.
+const TOOLS = process.env.CLAUDE_TOOLS ?? null;
 const SYSTEM_PROMPT = process.env.CLAUDE_SYSTEM_PROMPT || "";
 // Max attempts (initial + retries) to coerce a valid structured-output (OpenAI response_format)
 // JSON response out of the model before rejecting. See runStructuredCompletion.
@@ -1472,6 +1486,19 @@ function buildCliArgs(cliModel, systemPromptFile, opts = {}) {
     args.push("--tools", "", "--strict-mcp-config", "--disallowedTools", "mcp__*");
     // Do NOT push --allowedTools in multi mode: it is a PRE-APPROVAL list ("tool names to
     // allow", per --help), not a restriction, so it could only ever widen this.
+  } else if (TOOLS !== null) {
+    // The availability registry, and the only flag in this chain that can REMOVE a tool:
+    // `claude --help` describes --tools as the list of available tools from the built-in set,
+    // with the empty string disabling all of them.
+    //
+    // First in the chain because it is the narrowest statement of intent here. An operator who has
+    // said which tools exist should not have that widened by a pre-approval list, nor waived by
+    // skip-permissions -- a restriction that a convenience flag can switch off is not one.
+    //
+    // --allowedTools is deliberately NOT pushed alongside, for the same reason the multi-tenant
+    // branch above refuses it: it only ever pre-approves, so pairing the two would leave every
+    // tool available while the deny looked deliberate.
+    args.push("--tools", TOOLS);
   } else if (SKIP_PERMISSIONS) {
     args.push("--dangerously-skip-permissions");
   } else if (ALLOWED_TOOLS.length > 0) {
@@ -4436,6 +4463,12 @@ async function handleRequest(req, res) {
         timeout: TIMEOUT,
         maxConcurrent: MAX_CONCURRENT,
         circuitBreaker: "disabled",
+        // Reports CLAUDE_ALLOWED_TOOLS, which is NOT what governs when AUTH_MODE=multi or when
+        // CLAUDE_TOOLS is set -- both pass --tools and never --allowedTools. Left untouched on
+        // purpose, exactly as the multi-tenant case already is: this is a grandfathered Class B.2
+        // field, and changing the RULE that determines its value is a contract change needing its
+        // own ADR (CLAUDE.md, Class B.2), not a truthfulness fix folded into someone else's PR.
+        // The boot banner is the surface that tells an operator what is really in force.
         allowedTools: SKIP_PERMISSIONS ? "all (skip-permissions)" : ALLOWED_TOOLS,
         systemPrompt: SYSTEM_PROMPT ? `${SYSTEM_PROMPT.slice(0, 50)}...` : "(none)",
         mcpConfig: MCP_CONFIG || "(none)",
@@ -5023,7 +5056,11 @@ server.listen(PORT, BIND_ADDRESS, () => {
   // AGENTS.md names as its own defect class: the reasoning survived (both endpoints are equally
   // grandfathered) while the NAME it rested on did not, so a maintainer following the instruction
   // would have grepped /status, found nothing, and been unable to tell whether it applied.
+  // The arms below are in buildCliArgs' order on purpose. This banner's whole defect history is
+  // arms drifting out of step with the branch they describe, so a new arm goes in both or neither.
   console.log(`Tools: ${AUTH_MODE === "multi" ? 'none (multi-tenant: --tools "" empties the built-in schema)'
+                      : TOOLS === "" ? 'none (CLAUDE_TOOLS="" empties the built-in schema)'
+                      : TOOLS !== null ? `${TOOLS} (CLAUDE_TOOLS)`
                       : SKIP_PERMISSIONS ? "all (skip-permissions)" : ALLOWED_TOOLS.join(", ")}`);
   if (SYSTEM_PROMPT) console.log(`System prompt: "${SYSTEM_PROMPT.slice(0, 80)}..."`);
   if (MCP_CONFIG) console.log(`MCP config: ${MCP_CONFIG}`);
