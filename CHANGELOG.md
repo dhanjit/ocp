@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+### Fixed
+
+- **`CLAUDE_ALLOWED_TOOLS=""` could never disable a tool; `CLAUDE_TOOLS` can.** `--allowedTools` is a pre-approval list -- `claude --help` describes it as tool names "to allow" -- so it cannot take a tool away, and an empty `CLAUDE_ALLOWED_TOOLS` resolves to the default set besides. A single-user instance configured with it to be text-only ran with every built-in tool while its operator believed otherwise. `--tools` is the tool-availability registry, with `""` disabling all of them, and this adds `CLAUDE_TOOLS` to set it on the default (`-p`) spawn.
+
+  **The reported fix would have been worse than the bug.** The first diagnosis was the `||` reading an explicit empty string as unset. Making `CLAUDE_ALLOWED_TOOLS` honour `""` stops the flag being pushed at all, so the child runs on the CLI's own defaults, every tool, while `/health` reports an empty list: the natural acceptance check goes green on an instance that still has Bash.
+
+  **Measured with a real model turn through this spawn path**, not inferred from `--help`. Each run asks the model to `cat` a file holding a random nonce, which it can only echo back if Bash really ran:
+
+  | `CLAUDE_TOOLS` | approval flag passed | result |
+  |---|---|---|
+  | *(unset)* -- control | `--allowedTools`, default set | **Bash ran**, nonce echoed |
+  | `""` | none | **no Bash tool** |
+  | `Bash`, before approval composed | none | offered, call **denied** |
+  | `Bash` | `--allowedTools`, default set | **Bash ran**, nonce echoed |
+  | `Read` | `--allowedTools`, default set, **naming Bash** | **no Bash tool** |
+
+  The last row is the property the design rests on: approval cannot add availability, so the two axes compose safely. A non-empty `CLAUDE_TOOLS` therefore keeps the approval flag the instance would otherwise pass. Without it -- the third row -- an offered tool is denied, which does not hang, but leaves the variable's documented use useless.
+
+  **Empty and `none` both mean no tools, failing closed.** That is the opposite of `OCP_TUI_TOOLS`, where empty means every tool, and the difference is deliberate: `OCP_TUI_TOOLS` narrows a tool-using pane, so a stray blank must not strip an agent's tools, while `CLAUDE_TOOLS` exists to restrict. The `none` sentinel exists because **PowerShell 5.1 (`$env:X = ""`) and cmd (`set X=`) both delete a variable assigned an empty value** [measured], which then reads as unset and would silently leave every tool on. Whitespace-only values normalise to empty; entries are trimmed and split on commas only, so a scoped name such as `Bash(git commit:*)` keeps its space.
+
+  **Refuses to boot with `CLAUDE_TUI_MODE=true`.** A TUI pane never reads `CLAUDE_TOOLS`. `OCP_LOCAL_TOOLS`, in the same position, only warns -- but ignoring that leaves a model believing it has *no* tools, which fails safe, while ignoring `CLAUDE_TOOLS` leaves a requested restriction unapplied, which does not. A line in a boot log is exactly the signal the affected instance already had.
+
+  **`CLAUDE_ALLOWED_TOOLS` set to empty now warns at boot** that it cannot remove a tool, and names `CLAUDE_TOOLS=none`. A warning rather than a behaviour change, because changing what that variable resolves to would re-rule the `/health` field that reports it.
+
+  **Not endpoint-touching**: `buildCliArgs`, a module constant, three pure predicates in `lib/env.mjs`, a boot gate and the boot banner. No request handler is modified and no response gains a field, so `docs/governance/b2-response-keys.json` is unaffected and ADR 0012 is not engaged. `/health`'s `config.allowedTools` still reports `CLAUDE_ALLOWED_TOOLS`, which does not govern availability when `CLAUDE_TOOLS` is set -- left alone for the same reason the multi-tenant case was: re-ruling a grandfathered B.2 field is a contract change needing its own ADR. The boot banner reports what is in force.
+
 ## v3.33.0 — 2026-09-01
 
 > **Governance audit for this section**, per `CLAUDE.md`'s `release_kit.governance_audits`:

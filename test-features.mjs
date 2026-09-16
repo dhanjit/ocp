@@ -5118,13 +5118,145 @@ ltTest('integration: CLAUDE_TOOLS="" spawns `--tools ""`, so a single-user insta
       // buildCliArgs, one in the banner), so neither claim hides the other.
       const banner = buf.out.split("\n").find(l => l.startsWith("Tools: "));
       assert.ok(banner, `no "Tools:" banner line at all - ${ltDiag(buf)}`);
-      assert.equal(banner, 'Tools: none (CLAUDE_TOOLS="" empties the built-in schema)',
+      assert.equal(banner, 'Tools: none (CLAUDE_TOOLS: --tools "" empties the built-in schema)',
         `the boot banner still advertises a tool set: ${banner}`);
     } finally {
       child.kill("SIGKILL");
       await ltDrain(() => buf.closed, "tools-empty", 5000);
     }
   } finally { _ltRmRetry(dir); }
+});
+
+// ── CLAUDE_TOOLS: resolution, approval, and the two places it could silently fail open ─────────────
+//
+// Pure predicates first (lib/env.mjs), then the call sites. The call-site tests are the ones that
+// matter: a predicate can be perfect while server.mjs stops consulting it (#339).
+import { resolveToolsEnv, toolsModeError, allowedToolsEmptyWarning } from "./lib/env.mjs";
+
+test("resolveToolsEnv: absent is null -- no --tools flag, the CLI's own default set", () => {
+  assert.equal(resolveToolsEnv(undefined), null);
+});
+
+test("resolveToolsEnv: empty, whitespace and bare commas fail CLOSED to the empty schema", () => {
+  // The opposite of OCP_TUI_TOOLS, deliberately -- see lib/env.mjs for why.
+  for (const raw of ["", "   ", ",", " , , "]) {
+    assert.equal(resolveToolsEnv(raw), "", `${JSON.stringify(raw)} must disable every tool, not reach the CLI verbatim`);
+  }
+});
+
+test("resolveToolsEnv: 'none' in any case is the empty schema, but only as the WHOLE value", () => {
+  for (const raw of ["none", "NONE", " None "]) assert.equal(resolveToolsEnv(raw), "", JSON.stringify(raw));
+  // Inside a list it is just a name: the sentinel must never reinterpret a tool list.
+  assert.equal(resolveToolsEnv("Read,none"), "Read,none");
+});
+
+test("resolveToolsEnv: entries are trimmed and split on commas only, so a scoped name keeps its space", () => {
+  assert.equal(resolveToolsEnv(" Bash , Read "), "Bash,Read");
+  assert.equal(resolveToolsEnv("Bash(git commit:*),Read"), "Bash(git commit:*),Read");
+  assert.equal(resolveToolsEnv("default"), "default", "the CLI's own all-tools sentinel passes through untouched");
+});
+
+test("toolsModeError: refuses only when CLAUDE_TOOLS is set AND TUI mode is on", () => {
+  assert.equal(toolsModeError({ tools: null, tuiMode: true }), null, "TUI mode alone must boot");
+  assert.equal(toolsModeError({ tools: "", tuiMode: false }), null, "the default path honours it, so no refusal");
+  assert.equal(toolsModeError({ tools: "Read", tuiMode: false }), null);
+  // Both spellings of "set" refuse -- the empty schema is the case that fails open, not an edge.
+  assert.match(toolsModeError({ tools: "", tuiMode: true }), /CLAUDE_TOOLS[\s\S]*CLAUDE_TUI_MODE/);
+  assert.match(toolsModeError({ tools: "Read", tuiMode: true }), /CLAUDE_TOOLS[\s\S]*CLAUDE_TUI_MODE/);
+});
+
+test("allowedToolsEmptyWarning: warns on empty, whitespace or bare commas; silent when absent or naming a tool", () => {
+  for (const raw of ["", "  ", ",", " , "]) assert.match(allowedToolsEmptyWarning(raw), /cannot remove one/, JSON.stringify(raw));
+  assert.equal(allowedToolsEmptyWarning(undefined), null);
+  assert.equal(allowedToolsEmptyWarning("Read"), null);
+  assert.equal(allowedToolsEmptyWarning(" , Read"), null, "one real name among blanks is a real list");
+});
+
+// Boots a real server.mjs under `env`, sends one request, and returns the tool-flag tail of the argv
+// its child was REALLY spawned with, plus the "Tools:" banner and stderr. Shared by the cases below
+// so each one is a single claim rather than forty lines of the same boot.
+async function ltToolsTail(env, label) {
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  const argvFile = join(dir, `argv-${label}.txt`);
+  try {
+    const { child, buf, port } = await ltBootFresh(
+      { CLAUDE_AUTH_MODE: "none", CLAUDE_BIN: fake, ARGV_CAPTURE: argvFile, ...env }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `server never listened - ${ltDiag(buf)}`);
+      const r = await ltPostStatus(port, { model: "sonnet", messages: [{ role: "user", content: "hi" }] });
+      assert.equal(r.status, 200, `expected the spawn to succeed - ${r.status} ${r.text.slice(0, 200)}`);
+      const argv = ltArgvCalls(argvFile);
+      // Vacuity guard first (#405): [] would satisfy every deepEqual below that expects a short tail.
+      assert.ok(argv.length > 0, `no argv captured: the fake never ran - ${ltDiag(buf)}`);
+      const spIdx = argv.indexOf("--system-prompt-file");
+      assert.ok(spIdx > -1, `argv has no --system-prompt-file: ${JSON.stringify(argv.slice(0, 8))}`);
+      return { tail: argv.slice(spIdx + 2), banner: buf.out.split("\n").find((l) => l.startsWith("Tools: ")), err: buf.err };
+    } finally {
+      child.kill("SIGKILL");
+      await ltDrain(() => buf.closed, label, 5000);
+    }
+  } finally { _ltRmRetry(dir); }
+}
+
+const LT_DEFAULT_ALLOWED = ["Bash", "Read", "Write", "Edit", "Glob", "Grep", "WebSearch", "WebFetch", "Agent"];
+
+ltTest("integration: CLAUDE_TOOLS=none is the same empty schema, spelled so it survives PowerShell and cmd", async () => {
+  if (!LT_POSIX) return;
+  const { tail, banner } = await ltToolsTail({ CLAUDE_TOOLS: "none" }, "tools-none");
+  assert.deepEqual(tail, ["--tools", ""], `CLAUDE_TOOLS=none did not empty the schema: ${JSON.stringify(tail)}`);
+  assert.equal(banner, 'Tools: none (CLAUDE_TOOLS: --tools "" empties the built-in schema)', `banner: ${banner}`);
+});
+
+ltTest("integration: whitespace-only CLAUDE_TOOLS fails CLOSED to the empty schema, never reaching the CLI verbatim", async () => {
+  if (!LT_POSIX) return;
+  const { tail } = await ltToolsTail({ CLAUDE_TOOLS: "   " }, "tools-blank");
+  assert.deepEqual(tail, ["--tools", ""], `whitespace reached the CLI un-normalised: ${JSON.stringify(tail)}`);
+});
+
+// [measured 2026-09-16, real model turn through this spawn path] --tools Bash with NO approval flag:
+// the tool is offered and the call is DENIED. So the approval axis must survive a non-empty list, or
+// the documented use of the variable produces tools the model can see and cannot use.
+ltTest("integration: a non-empty CLAUDE_TOOLS keeps the approval flags, so the offered tools are usable", async () => {
+  if (!LT_POSIX) return;
+  const { tail, banner, err } = await ltToolsTail({ CLAUDE_TOOLS: " Bash , Read " }, "tools-list");
+  assert.deepEqual(tail, ["--tools", "Bash,Read", "--allowedTools", ...LT_DEFAULT_ALLOWED],
+    `availability and approval did not compose: ${JSON.stringify(tail)}`);
+  assert.equal(banner, "Tools: Bash, Read (CLAUDE_TOOLS)", `banner: ${banner}`);
+  // CLAUDE_ALLOWED_TOOLS is unset here, so its empty-value warning must not fire -- the call-site
+  // control for the warning test below, which a hardcoded argument would otherwise pass.
+  assert.doesNotMatch(err, /CLAUDE_ALLOWED_TOOLS is set but empty/, "the empty-allowlist warning fired on an unset variable");
+});
+
+ltTest("integration: a non-empty CLAUDE_TOOLS composes with CLAUDE_SKIP_PERMISSIONS on the approval axis", async () => {
+  if (!LT_POSIX) return;
+  const { tail } = await ltToolsTail({ CLAUDE_TOOLS: "Read", CLAUDE_SKIP_PERMISSIONS: "true" }, "tools-skip");
+  assert.deepEqual(tail, ["--tools", "Read", "--dangerously-skip-permissions"],
+    `skip-permissions did not compose with a tool list: ${JSON.stringify(tail)}`);
+});
+
+ltTest("integration: CLAUDE_TOOLS with CLAUDE_TUI_MODE=true REFUSES to boot rather than silently ignore the restriction", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir();
+  try {
+    const fake = ltFake(dir);
+    const { child, buf } = await ltBootFresh({ CLAUDE_TOOLS: "none", CLAUDE_TUI_MODE: "true", CLAUDE_BIN: fake }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.closed || /FATAL/.test(buf.err)), `no verdict - ${ltDiag(buf)}`);
+      await ltDrain(() => buf.closed, "tools-tui", 5000);
+      assert.notEqual(buf.exit, 0, `must exit non-zero - ${ltDiag(buf)}`);
+      assert.match(buf.err, /FATAL[\s\S]*CLAUDE_TOOLS[\s\S]*CLAUDE_TUI_MODE/, `the FATAL must name both variables - ${ltDiag(buf)}`);
+      assert.match(buf.err, /Refusing to start/, `- ${ltDiag(buf)}`);
+      assert.ok(!/listening on/.test(buf.out), `it must not have served anything - ${ltDiag(buf)}`);
+    } finally { child.kill("SIGKILL"); }
+  } finally { _ltRmRetry(dir); }
+});
+
+ltTest("integration: CLAUDE_ALLOWED_TOOLS set to empty WARNS at boot that it cannot remove a tool", async () => {
+  if (!LT_POSIX) return;
+  const { tail, err } = await ltToolsTail({ CLAUDE_ALLOWED_TOOLS: "" }, "allowed-empty");
+  assert.match(err, /WARNING: CLAUDE_ALLOWED_TOOLS is set but empty/, `no boot warning, so the original trap is still silent: ${err.slice(0, 300)}`);
+  // The warning describes what happens; it does not change it. Changing it would re-rule /health.
+  assert.deepEqual(tail, ["--allowedTools", ...LT_DEFAULT_ALLOWED], `the empty allowlist changed behaviour: ${JSON.stringify(tail)}`);
 });
 
 // ── #370: the TUI LAN gate's call site (server.mjs:829) ────────────────────────────────────────
