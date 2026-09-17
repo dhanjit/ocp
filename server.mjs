@@ -15,6 +15,9 @@
  *   CLAUDE_BIN                   — path to claude binary (default: auto-detect)
  *   CLAUDE_TIMEOUT               — per-request timeout in ms (default: 600000)
  *   CLAUDE_ALLOWED_TOOLS         — comma-separated tools to allow (default: expanded set)
+ *   CLAUDE_TOOLS                 — comma-separated tools to make AVAILABLE; "" disables all of
+ *                                  them. Unlike CLAUDE_ALLOWED_TOOLS, which is a pre-approval
+ *                                  list and can only widen, this is the flag that can remove one
  *   CLAUDE_SKIP_PERMISSIONS      — "true" to bypass all permission checks (default: false)
  *   CLAUDE_SYSTEM_PROMPT         — system prompt appended to all requests
  *   CLAUDE_MCP_CONFIG            — path to MCP server config JSON file
@@ -57,7 +60,7 @@ import { createSerialMutex, createTtlCache, orderLabelsLastGoodFirst, scrubInbou
 import { makeResolveSpawnToken } from "./lib/spawn-token.mjs";
 import { classifyCapabilityProbe, capabilityBootError } from "./lib/claude-capability.mjs";
 import { hasImageContent, buildImageBlocks, buildStreamJsonInput, MultimodalError } from "./lib/multimodal.mjs";
-import { parsePositiveInt } from "./lib/env.mjs";
+import { parsePositiveInt, resolveToolsEnv, toolsModeError, allowedToolsEmptyWarning } from "./lib/env.mjs";
 import { appendOperatorPrompt, promptCharBudgetFor, fallbackPromptCharBudget, resolveGlobalPromptCharOverride, selectPromptWrapper, localToolsSafetyError } from "./lib/prompt.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -209,7 +212,7 @@ function resolveClaude() {
 const OCP_SYSTEM_PROMPT_WRAPPER = `You are accessed via the OCP HTTP proxy. You do NOT have access to any local filesystem, working directory, shell, git status, or machine environment. Do not infer or invent such information from any context you observe. Respond only based on the conversation provided.`;
 
 // Positive counterpart used only when OCP_LOCAL_TOOLS=1 — a single-user, loopback-bound instance
-// where the operator's own model legitimately has tools (the `-p` path passes --allowedTools). Tells
+// where the operator's own model legitimately has tools (the `-p` path pre-approves them via --allowedTools). Tells
 // the model it MAY use them instead of disclaiming access it actually holds. Off by default; the
 // default wrapper above is byte-for-byte unchanged. Selecting the positive wrapper does NOT expand
 // the tool surface (governed independently by --tools/--disallowedTools, and NOT by --allowedTools,
@@ -367,6 +370,20 @@ const SKIP_PERMISSIONS = process.env.CLAUDE_SKIP_PERMISSIONS === "true";
 const ALLOWED_TOOLS = (process.env.CLAUDE_ALLOWED_TOOLS ||
   "Bash,Read,Write,Edit,Glob,Grep,WebSearch,WebFetch,Agent"
 ).split(",").map(s => s.trim()).filter(Boolean);
+// CLAUDE_TOOLS: which built-in tools the default (-p) spawn is OFFERED. How the raw value resolves
+// -- empty and "none" both mean none, why that is the opposite of OCP_TUI_TOOLS, and why a sentinel
+// exists at all -- is with resolveToolsEnv in lib/env.mjs.
+//
+// A NEW variable rather than a fix to CLAUDE_ALLOWED_TOOLS above, on purpose. That one is a
+// pre-approval list (`claude --help`: tool names "to allow"), so it cannot take a tool away. Making
+// it honour "" would only stop the flag being pushed: the child then runs on the CLI's own
+// defaults, every tool, while /health reports an empty list -- worse than the defect it replaces.
+//
+// /health's config.allowedTools still reports CLAUDE_ALLOWED_TOOLS, which does not govern
+// availability when this is set (nor under AUTH_MODE=multi). Left alone deliberately: it is a
+// grandfathered Class B.2 field, and changing the rule that determines its value is a contract
+// change needing its own ADR. The boot banner is the surface that reports what is in force.
+const TOOLS = resolveToolsEnv(process.env.CLAUDE_TOOLS);
 const SYSTEM_PROMPT = process.env.CLAUDE_SYSTEM_PROMPT || "";
 // Max attempts (initial + retries) to coerce a valid structured-output (OpenAI response_format)
 // JSON response out of the model before rejecting. See runStructuredCompletion.
@@ -878,6 +895,20 @@ if (_localToolsBootError) {
   console.error(`FATAL: ${_localToolsBootError}\n  See README § "Environment Variables" (OCP_LOCAL_TOOLS) and docs/adr/0007-tui-interactive-mode.md. Refusing to start.`);
   process.exit(1);
 }
+
+// CLAUDE_TOOLS cannot be honoured in TUI mode, so refuse rather than leave a requested restriction
+// silently unapplied. Why this refuses where OCP_LOCAL_TOOLS, in the same position, only warns is
+// with toolsModeError in lib/env.mjs: the two fail in opposite directions.
+const _toolsModeBootError = toolsModeError({ tools: TOOLS, tuiMode: TUI_MODE });
+if (_toolsModeBootError) {
+  console.error(`FATAL: ${_toolsModeBootError}\n  See README § "Environment Variables" (CLAUDE_TOOLS). Refusing to start.`);
+  process.exit(1);
+}
+
+// CLAUDE_ALLOWED_TOOLS="" reads as "no tools" and resolves to every tool. Say so at boot; the
+// reasons it is a warning and not a behaviour change are with allowedToolsEmptyWarning.
+const _allowedToolsEmpty = allowedToolsEmptyWarning(process.env.CLAUDE_ALLOWED_TOOLS);
+if (_allowedToolsEmpty) console.warn(`WARNING: ${_allowedToolsEmpty}`);
 
 if (PROXY_ANONYMOUS_KEY && AUTH_MODE !== "multi") {
   console.warn("WARNING: PROXY_ANONYMOUS_KEY is set but AUTH_MODE is not 'multi' — anonymous key will be ignored");
@@ -1472,10 +1503,31 @@ function buildCliArgs(cliModel, systemPromptFile, opts = {}) {
     args.push("--tools", "", "--strict-mcp-config", "--disallowedTools", "mcp__*");
     // Do NOT push --allowedTools in multi mode: it is a PRE-APPROVAL list ("tool names to
     // allow", per --help), not a restriction, so it could only ever widen this.
-  } else if (SKIP_PERMISSIONS) {
-    args.push("--dangerously-skip-permissions");
-  } else if (ALLOWED_TOOLS.length > 0) {
-    args.push("--allowedTools", ...ALLOWED_TOOLS);
+  } else {
+    // Two independent axes, and they compose.
+    //
+    // AVAILABILITY is --tools: `claude --help` calls it "the list of available tools from the
+    // built-in set", with "" disabling all of them. It is the only flag in this chain that can
+    // remove a tool.
+    //
+    // APPROVAL is --dangerously-skip-permissions or --allowedTools, and an offered tool needs it to
+    // be usable at all. [measured 2026-09-16, a real model turn through this spawn path] --tools
+    // Bash with no approval flag: the tool is offered and the call is DENIED. It does not hang, but
+    // it cannot be used, so a non-empty CLAUDE_TOOLS keeps the approval flag this instance would
+    // otherwise pass.
+    //
+    // With --tools "" nothing is offered, so there is nothing to approve and no approval flag is
+    // passed. That is the only reason. Approval cannot add availability [measured 2026-09-16: --tools
+    // Read with an --allowedTools list naming Bash left the model with no Bash tool], so pairing the
+    // two could never have widened anything.
+    if (TOOLS !== null) args.push("--tools", TOOLS);
+    if (TOOLS === "") {
+      // Nothing is offered, so there is nothing to approve.
+    } else if (SKIP_PERMISSIONS) {
+      args.push("--dangerously-skip-permissions");
+    } else if (ALLOWED_TOOLS.length > 0) {
+      args.push("--allowedTools", ...ALLOWED_TOOLS);
+    }
   }
 
   // MCP config
@@ -5023,7 +5075,13 @@ server.listen(PORT, BIND_ADDRESS, () => {
   // AGENTS.md names as its own defect class: the reasoning survived (both endpoints are equally
   // grandfathered) while the NAME it rested on did not, so a maintainer following the instruction
   // would have grepped /status, found nothing, and been unable to tell whether it applied.
+  // The arms below are in buildCliArgs' order on purpose. This banner's whole defect history is
+  // arms drifting out of step with the branch they describe, so a new arm goes in both or neither.
+  // CLAUDE_TOOLS cannot reach these arms in TUI mode, where it would be inert: toolsModeError
+  // refuses that boot first, so they can never describe a surface a TUI pane does not have.
   console.log(`Tools: ${AUTH_MODE === "multi" ? 'none (multi-tenant: --tools "" empties the built-in schema)'
+                      : TOOLS === "" ? 'none (CLAUDE_TOOLS: --tools "" empties the built-in schema)'
+                      : TOOLS !== null ? `${TOOLS.split(",").join(", ")} (CLAUDE_TOOLS)`
                       : SKIP_PERMISSIONS ? "all (skip-permissions)" : ALLOWED_TOOLS.join(", ")}`);
   if (SYSTEM_PROMPT) console.log(`System prompt: "${SYSTEM_PROMPT.slice(0, 80)}..."`);
   if (MCP_CONFIG) console.log(`MCP config: ${MCP_CONFIG}`);
